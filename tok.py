@@ -11,7 +11,8 @@ import json, glob, os, collections, datetime, sys, unicodedata
 #   python3 ~/tok.py daily                    日別サマリ (トークン + コスト)
 #
 # コスト = Bedrock 標準/グローバル・オンデマンド単価 (Anthropic API 標準と同額)。
-#   cache書込 = input*1.25 (5分キャッシュ), cache読込 = input*0.1。
+#   cache書込 = 5分キャッシュ input*1.25 / 1時間キャッシュ input*2 (実データの内訳で按分)。
+#   cache読込 = input*0.1。
 # ============================================================================
 
 RATES = {  # (input, output) USD / 1M tokens
@@ -54,8 +55,10 @@ elif args:
         print(f"日時の形式が不正です: {args[0]!r}  (例: \"2026-06-26 09:00\")"); sys.exit(1)
 
 # ---- 全ログを1パスで読み込み ----
+# rows の各要素: (localdt, modelkey, in, out, cc5, cc1, cr)
+#   cc5 = 5分キャッシュ書込, cc1 = 1時間キャッシュ書込 (usage.cache_creation の内訳)
 seen = set()
-rows = []  # (localdt, modelkey, in, out, cc, cr)
+rows = []
 files = glob.glob(os.path.expanduser('~/.claude/projects/**/*.jsonl'), recursive=True)
 for f in files:
     try:
@@ -76,42 +79,48 @@ for f in files:
                 except: continue
                 k = model_key(msg.get('model'))
                 if k is None: continue
+                cc_total = usage.get('cache_creation_input_tokens', 0)
+                cd = usage.get('cache_creation') or {}
+                cc5 = cd.get('ephemeral_5m_input_tokens', 0)
+                cc1 = cd.get('ephemeral_1h_input_tokens', 0)
+                if cc5 == 0 and cc1 == 0:      # 内訳が無い古い記録は5分扱いにフォールバック
+                    cc5 = cc_total
                 rows.append((dt, k, usage.get('input_tokens', 0), usage.get('output_tokens', 0),
-                             usage.get('cache_creation_input_tokens', 0), usage.get('cache_read_input_tokens', 0)))
+                             cc5, cc1, usage.get('cache_read_input_tokens', 0)))
     except: continue
 
-def row_cost(k, i, ot, cc, cr):
+def row_cost(k, i, ot, cc5, cc1, cr):
     ir, orr = RATES[k]
-    return (i*ir + ot*orr + cc*ir*1.25 + cr*ir*0.1) / 1e6
+    return (i*ir + ot*orr + cc5*ir*1.25 + cc1*ir*2 + cr*ir*0.1) / 1e6
 
 # ---- モデル別コスト表 ----
 def print_cost_table(sel):
     W = [('model',7,False),('応答',5,True),('input',12,True),('output',11,True),
          ('cache_w',13,True),('cache_r',14,True),('コスト',12,True)]
     per = collections.defaultdict(lambda: collections.Counter())
-    for dt, k, i, ot, cc, cr in sel:
-        c = per[k]; c['in'] += i; c['out'] += ot; c['cc'] += cc; c['cr'] += cr; c['n'] += 1
+    for dt, k, i, ot, cc5, cc1, cr in sel:
+        c = per[k]; c['in'] += i; c['out'] += ot; c['cc5'] += cc5; c['cc1'] += cc1; c['cr'] += cr; c['n'] += 1
     line = '-'*sum(w for _, w, _ in W)
     print(line); print(row([(h, w, r) for h, w, r in W])); print(line)
     grand = 0.0; gc = collections.Counter()
     for k in sorted(per):
-        c = per[k]; cost = row_cost(k, c['in'], c['out'], c['cc'], c['cr']); grand += cost
-        for kk in ('in','out','cc','cr','n'): gc[kk] += c[kk]
+        c = per[k]; cost = row_cost(k, c['in'], c['out'], c['cc5'], c['cc1'], c['cr']); grand += cost
+        for kk in ('in','out','cc5','cc1','cr','n'): gc[kk] += c[kk]
         print(row([(k,7,False),(c['n'],5,True),(fmt(c['in']),12,True),(fmt(c['out']),11,True),
-                   (fmt(c['cc']),13,True),(fmt(c['cr']),14,True),(usd(cost),12,True)]))
+                   (fmt(c['cc5']+c['cc1']),13,True),(fmt(c['cr']),14,True),(usd(cost),12,True)]))
     print(line)
     print(row([('合計',7,False),(gc['n'],5,True),(fmt(gc['in']),12,True),(fmt(gc['out']),11,True),
-               (fmt(gc['cc']),13,True),(fmt(gc['cr']),14,True),(usd(grand),12,True)]))
+               (fmt(gc['cc5']+gc['cc1']),13,True),(fmt(gc['cr']),14,True),(usd(grand),12,True)]))
     return grand
 
 # ============================ 各モード ============================
 if mode == 'hourly':
     today = datetime.datetime.now().astimezone().date()
     hrs = collections.defaultdict(lambda: collections.Counter())
-    for dt, k, i, ot, cc, cr in rows:
+    for dt, k, i, ot, cc5, cc1, cr in rows:
         if dt.date() != today: continue
         x = hrs[dt.strftime('%H:00')]
-        x['in'] += i; x['out'] += ot; x['cc'] += cc; x['cr'] += cr; x['n'] += 1
+        x['in'] += i; x['out'] += ot; x['cc'] += cc5 + cc1; x['cr'] += cr; x['n'] += 1
     W = [('時刻',6,False),('応答',5,True),('入力',11,True),('出力',11,True),
          ('cache_w',13,True),('cache_r',14,True),('入+出',11,True)]
     print(f"== {today} 時間帯別 ==")
@@ -126,8 +135,8 @@ if mode == 'hourly':
 elif mode == 'range':
     sel = [r for r in rows if (not start or r[0] >= start) and (not end or r[0] < end)]
     c = collections.Counter()
-    for _, k, i, ot, cc, cr in sel:
-        c['in'] += i; c['out'] += ot; c['cc'] += cc; c['cr'] += cr
+    for _, k, i, ot, cc5, cc1, cr in sel:
+        c['in'] += i; c['out'] += ot; c['cc'] += cc5 + cc1; c['cr'] += cr
     print(f"範囲: {start or '(最初)'} 〜 {end or '(最新)'}")
     print(f"やり取り(assistant応答数): {len(sel)}")
     print(f"入力         : {fmt(c['in'])}")
@@ -152,9 +161,9 @@ elif mode == 'daily':
     gtot = 0.0
     for day in sorted(days):
         sel = days[day]
-        io = sum(i+ot for _, k, i, ot, cc, cr in sel)
-        tot = sum(i+ot+cc+cr for _, k, i, ot, cc, cr in sel)
-        cost = sum(row_cost(k, i, ot, cc, cr) for _, k, i, ot, cc, cr in sel)
+        io = sum(i+ot for _, k, i, ot, cc5, cc1, cr in sel)
+        tot = sum(i+ot+cc5+cc1+cr for _, k, i, ot, cc5, cc1, cr in sel)
+        cost = sum(row_cost(k, i, ot, cc5, cc1, cr) for _, k, i, ot, cc5, cc1, cr in sel)
         gtot += cost
         print(row([(day,11,False),(len(sel),6,True),(fmt(io),14,True),(fmt(tot),16,True),(usd(cost),12,True)]))
     print('-'*sum(w for _, w, _ in W))
