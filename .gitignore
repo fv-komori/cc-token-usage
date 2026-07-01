@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 出力・ローカルデータ（使用量や金額を誤ってコミットしない）
+*.log
+*.csv
+*.jsonl
+out/
+tmp/
+
+# OS
+.DS_Store
